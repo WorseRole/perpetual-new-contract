@@ -1,0 +1,7 @@
+out/
+node_modules/
+lib/
+*.ffi
+*.cache
+*.log
+.DS_Store

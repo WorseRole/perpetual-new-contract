@@ -1,0 +1,205 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+/**
+ * @title Perpetual - 永续合约市场
+ * @author 
+ * @notice 单个永续合约市场的核心资产负债表合约
+ * 
+ * 核心概念：
+ * - paper：仓位数量，正数为多头，负数为空头
+ * - credit：资金量，与 paper 配合计算盈亏
+ * - reducedCredit：约减后的 credit，用于优化存储
+ * - fundingRate: 资金费率（累计值）
+ * 
+ * 关键公式:
+ * credit = paper * fundingRate + reducedCredit
+ * 
+ * 举例：
+ * - 以 $30000 做多 1 BTC : paper = 1e18, credit = -30000e6
+ * - 以 $30000 做空 1 BTC : paper = -1e18, credit = 30000e6
+ * 
+ * 存储优化：
+ * 使用 int128 存储 paper 和 reducedCredit，可以在一个slot 中存储
+ * 计算时转换为 int256 以保证精度和范围
+ */
+contract Perpetual is Ownable, IPerpetual, ReentrancyGuard {
+
+    using SignedDecimalMath for int256;
+
+    // =========== 存储 ===========
+
+    /**
+     * @notice 余额结构体，使用 int128 节省gas
+     * int128 最大值约 1.7e38, 对于大多数交易足够
+     * paper 通常是 1e18 基数的小数
+     */
+    struct balance {
+        int128 paper;   // 仓位数量，正数为多头，负数为空头
+        int128 reducedCredit;   // 约减后的资金量，用于优化存储
+    }
+
+    // @notice 交易者地址到余额的映射 (交易者地址 => 余额)
+    mapping(address => balance) balanceMap;
+
+    // @notice 资金费率（累计值）
+    int256 fundingRate;
+
+    // =========== 事件 ===========
+
+    /**
+     * @notice 余额变化事件
+     * @param trader 交易者地址
+     * @param paperChange paper 变化量
+     * @param creditChange credit 变化量
+     */
+    event BalanceChange(address indexed trader, int256 paperChange, int256 creditChange);
+
+    /**
+     * @notice 资金费率更新事件
+     * @param oldFundingRate 旧的资金费率
+     * @param newFundingRate 新的资金费率
+     */
+    event UpdateFundingRate(int256 oldFundingRate, int256 newFundingRate);
+
+    // ============ 构造函数 ============
+
+    /**
+     * @notice 构造函数，设置合约所有者
+     * @param _owner 所有者地址（通常是MetaNodeDealer）
+     * @dev Perpetual 的 owner 是 Dealer，这样 Dealer 可以调用特权函数
+     */
+    constructor(address _owner) {
+        transferOwnership(_owner);
+    }
+
+    // =========== 余额相关函数 ===========
+
+    /**
+     * 存储优化说明：
+     * 我们存储 reducedCredit 而不是直接存储 credit
+     * 这样在资金费率更新后，credit 值会自动更新，无需额外的存储写入
+     * 
+     * 公式： credit = (paper * fundingRage) + reducedCredit
+     * 
+     * 资金费率说明：
+     * 这里的 fundingRate 与 CEX 的含义略有不同
+     * fungdingRate 是累计值，其绝对值没有意义，只有变化量才重要
+     * 
+     * 例如：如果 fundingRate 在某次更新中增加了 5
+     * - 每持有 1 paper 多头，你讲获得 5 credit
+     * - 每持有 1 paper 空头，你将支付 5 credit
+     */
+
+
+    /**
+     * @notice 查询交易者在此市场的余额
+     * @param trader 交易者地址
+     * @return paper 仓位数量，正数为多头，负数为空
+     * @return credit 资金量，包含资金费率调整
+     */
+    function balanceOf(address trader) external view returns (int256 paper, int256 credit) {
+        paper = int256(balanceMap[trader].paper);
+        // 使用公式计算实际 credit = paper * fundingRate + reducedCredit
+        credit = paper.decimalMul(fundingRate) + int256(balanceMap[trader].reducedCredit);
+    }
+
+    /**
+     * @notice 更新资金费率（仅 owner/Dealer 可调用）
+     * @param newFundingRate 新的资金费率
+     * @dev 资金费率的变化会自动影响所有持仓者的credit
+     *      多头在资金费率上升时获益，空头在资金费率下降时获益
+     */
+    function updateFundingRate(int256 newFundingRate) external onlyOwner {
+        int256 oldFundingRate = fundingRate;
+        fundingRate = newFundingRate;
+        emit UpdateFundingRate(oldFundingRate, newFundingRate);
+    }
+
+
+    /**
+     * @notice 获取当前资金费率
+     * @return fundingRate 当前资金费率(累计值)
+     */
+    function getFundingRate() external view returns (int256) {
+        return fundingRate;
+    }
+
+
+    // =========== 交易 ==========
+
+
+    /**
+     * @notice 执行交易，更新相关交易者的余额
+     * @param tradeData 编码的交易数据，由 Dealer 解析
+     * @dev 交易流程：
+     *     1. 调用 Dealer.approveTrade 验证订单并计算结果
+     *     2. 结算每个交易者的余额变化
+     *     3. 检查所有交易者的安全性
+     */
+    function trade(bytes calldata tradeData) external nonReentrant {
+        // 调用 Dealer 验证交易并获取结算结果
+        (address[] memory traderList, 
+            int256[] memory paperChangeList, 
+            int256[] memory creditChangeList) =
+         IDealer(owner()).approveTrade(msg.sender, tradeData);
+
+         // 结算每个交易者的余额
+         for (uint256 i = 0; i < traderList.length;) {
+            _settle(traderList[i], paperChangeList[i], creditChangeList[i]);
+            unchecked {
+                ++i;
+            }
+         }
+
+         // 确保所有交易者交易后都是安全的
+         require(IDealer(owner()).isAllSafe(traderList), "TRADER_NOT_SAFE");
+    }
+
+
+    // ========== 清算 ==========
+
+
+    /**
+     * @notice 清算不安全的仓位
+     * @param liquidator 清算者地址
+     * @param liquidatedTrader 被清算者地址
+     * @param requestPaper 请求清算的仓位数量
+     * @param expectedCredit 期望的credit 变化（用于价格保护）
+     * @return liqtorPaperChange 清算者的paper 变化
+     * @return liqtorCreditChange 清算者的 credit 变化
+     * 
+     * @dev 清算流程：
+     *     1. 向 Dealer 请求清算，获取结算金额
+     *     2. 验证价格保护 （防止清算价格过差）
+     *     3. 结算双方余额
+     *     4. 检查清算者安全性
+     *     5. 如果被清算者仓位归零，处理可能的坏账
+     * 
+     * 清算机制说明：
+     * - 当交易者的保证金率低于维持保证金率时，可被清算
+     * - 清算者以一定折扣接手被清算者的仓位
+     * - 价格保护机制防止清算价格偏离太多，保护被清算者免受恶意清算
+     */
+    function liquidate(
+        address liquidator, adress liquidatedTrader, 
+        int256 requestPaper, int256 expectedCredit) external nonReentrant 
+        returns (int256 liqtorPaperChange, int256 liqtorCreditChange) {
+
+            // liqed => 被清算者，面临清算风险
+            // liqtor => 清算者，发起清算的一方
+            int256 liqedPaperChange;
+            int256 liqedCreditChange;
+            (liqtorPaperChange, liqtorCreditChange, liqedPaperChange, liqedCreditChange) = 
+                IDealer(owner()).approveLiquidation(msg.sender, liquidator, liquidatedTrader, requestPaper);
+            
+            // 价格保护检查
+            // 期望价格 = expectCredit / requestpaper * -1
+            // 执行价格 = liqtorCreditChange / liqtorPaperChange * -1
+
+
+    }
+
+
+
+}
