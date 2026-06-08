@@ -196,7 +196,67 @@ contract Perpetual is Ownable, IPerpetual, ReentrancyGuard {
             // 价格保护检查
             // 期望价格 = expectCredit / requestpaper * -1
             // 执行价格 = liqtorCreditChange / liqtorPaperChange * -1
+            if (liqtorPaperChange < 0) {    // 清算者paper为负数，表示开空仓
+                // 开空仓，需要检查清算者的价格是否过高，以防止清算者被恶意清算， 
+                // 为false则进行价格保护
+                require(
+                    liqtorCreditChange * requestPaper <= expectedCredit * liqtorPaperChange, 
+                    "LIQUIDATION_PRICE_PROTECTION"
+                );
+            } else {
+                // 开多仓，需要检查清算者的价格是否过低， 以防止清算者被恶意清算，
+                // 为false则进行价格保护
+                require(
+                    liqtorCreditChange * requestPaper >= expectedCredit * liqtorPaperChange, 
+                    "LIQUIDATION_PRICE_PROTECTION"
+                );
+            }
 
+            // 结算双方余额
+            _settle(liquidatedTrader, liqedPaperChange, liqedCreditChange);
+            _settle(liquidator, liqtorPaperChange, liqtorCreditChange);
+
+            // 确保清算者是安全的
+            require(IDeaker(owner()).isSafe(liquidator), "LIQUIDATOR_NOT_SAFE");
+
+            // 如果被清算者仓位归零，检查并处理坏账
+            if (balanceMap[liquidatedTrader].paper == 0) {
+                IDealer(owner()).handleBadDebt(liquidatedTrader);
+            }
+    }
+
+
+    // ============= 结算 ==========
+
+    function _settle(address trader, int256 paperChange, int256 creditChange) internal {
+        bool isNewPosition = balanceMap[trader].paper == 0;
+        int256 rate = fundingRate;  // 缓存以省gas
+
+        // 计算新的credit
+        int256 credit = int256(balanceMap[trader].paper).decimalMul(rate) + int256(balanceMap[trader].reducedCredit) + creditChange;
+
+        // 计算新的 paper
+        int128 newPaper = balanceMap[trader].paper + SageCast.toInt128(paperChange);
+
+        // 反推reducedCredit = credit - paper * fundingRate
+        int256 reducedCredit = credit - int256(newPaper).decimalMul(rate);
+
+        // 更新余额
+        balanceMap[trader].paper = newPaper;
+        balanceMap[trader].reducedCredit = reducedCredit;
+        
+        emit BalanceChange(trader, paperChange, creditChange);
+
+        // 如果是新开仓，通知 Dealer 记录
+        if (isNewPosition) {
+            IDealer(owner()).openPosition(trader);
+        }
+
+        // 如果仓位归零，实现盈亏
+        if (newPaper == 0) {
+            IDealer(owner()).realizePnL(trader, balanceMap[trader].reducedCredit);
+            balanceMap[trader].reducedCredit = 0;
+        }
 
     }
 
