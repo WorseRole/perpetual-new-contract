@@ -80,7 +80,7 @@ library Liquidation {
      * @param liquidatedTrader 被清算者
      * @param fee 保险费金额
      */
-    event ChangeInsurance(address perp, address indexed liquidatedTrader, uint256 fee);
+    event ChargeInsurance(address perp, address indexed liquidatedTrader, uint256 fee);
 
     /**
      * 处理坏账事件
@@ -205,13 +205,14 @@ library Liquidation {
 
 
     /**
-     * 
+     * 计算清算金额
      * @param state 系统状态
      * @param perp 永续合约地址
      * @param liquidatedTrader 被清算者地址
      * @param requestPaperAmount 请求清算的数量
-     * @return liqtorPaperChange 清算者的paper 变化
-     * @return liqtorCreditChange 清算者的credit 变化
+     * 
+     * @return liqtorPaperChange 清算者的 paper 变化
+     * @return liqtorCreditChange 清算者的 credit 变化
      * @return insuranceFee 保险费
      * 
      * @dev 使用固定折扣价格模型：
@@ -225,7 +226,126 @@ library Liquidation {
         address liquidatedTrader, 
         int256 requestPaperAmount) public view 
         returns (int256 liqtorPaperChange, int256 liqtorCreditChange, uint256 insuranceFee) {
+            // 检查被清算者是否真的不安全
+            require(!is_MMSafe(state, liquidatedTrader), Errors.ACCOUNT_IS_SAFE);
 
+            // 获取并验证仓位
+            (int256 brokenPaperAmount) = IPerpetual(perp).balanceOf(liquidatedTrader);
+            require(brokenPaperAmount != 0, Errors.TRADER_HAS_NO_POSITION);
+
+            // 清算方向必须与仓位方向一致
+            require(brokenPaperAmount * requestPaperAmount > 0, Errors.LIQUIDATION_REQUEST_AMOUNT_WRONG);
+            // 限制清算数量不超过实际仓位
+            liqtorPaperChange = requestPaperAmount,abs() > brokenPaperAmount.abs() ? brokenPaperAmount : requestPaperAmount.abs();
+
+            // 计算清算价格
+            Types.RiskParams storage params = state.perpRiskParams[perp];
+            uint256 price = IPriceSource(params.markPriceSource).getMarkPrice();
+            uint256 priceOffset = price * params.liquidationPriceOff / Types.ONE;
+            // 清算多头给折扣价（低于市价），清算空头加溢价（高于市价）
+            price = liqtorPaperChange > 0 ? price - priceOffset : price + priceOffset;
+
+            // 计算 credit 变化：清算者付出 credit 获得 paper
+            liqtorCreditChange = -1 * liqtorPaperChange.decimalMul(SafeCast.toInt256(price));
+
+            // 计算保险费: 清算者的 credit 变化 * 保险费率
+            insuraceFee = (liqtorCreditChange.abs() * params.insuranceFeeRate) / Types.ONE;
+    }
+
+
+    /**
+     * @notice 执行清算请求
+     * @param state 系统状态
+     * @param perp 永续合约地址
+     * @param executor 清算执行者
+     * @param liquidator 清算者
+     * @param liquidatedTrader 被清算者
+     * @param requestPaperAmount 请求清算的数量
+     * 
+     * @return liqtorPaperChange 清算者的 paper 变化
+     * @return liqtorCrediChange 清算者的 credit 变化
+     * @return liqedPaperChange 被清算者的 paper 变化
+     * @return liqedCreditChange 被清算者的 credit 变化
+     * 
+     * @dev 执行流程：
+     *      1. 验证执行者权限
+     *      2. 计算清算金额
+     *      3. 保险费转入保险账户
+     *      4. 触发清算事件
+     */
+    function requestLiquidation(
+        Types.State storage state,
+        address perp,
+        address executor,
+        address liquidator,
+        address liquidatedTrader,
+        int256 requestPaperAmount
+    ) external returns (int256 liqtorPaperChange, int256 liqtorCrediChange, int256 liqedPaperChange, int256 liqedCreditChange) {
+        // 验证执行者权限：必须是清算者本人或其授权操作人员
+        require(
+            executor == liquidator || state.operatorRegistry[liquidator][executor], Errors.INVALID_LIQUIDATION_EXECUTOR
+        );
+
+        // 禁止自我清算
+        require(liquidatedTrader != liquidator, Errors.SELF_LIQUIDATION_NOT_ALLOWED);
+
+        // 计算清算金额
+        uint256 insuranceFee;
+        (liqtorPaperChange, liqtorCreditChange, insuranceFee) = 
+            getLiquidateCreditAmount(state, perp, liquidatedTrader, requestPaperAmount);
+        
+        // 保险费转入保险账户
+        state.primaryCredit[state.insurance] += SafeCast.toInt256(insuranceFee);
+
+        // 计算被清算者的变化（与清算者相反，另外扣除保险费）
+        liqedCreditChange = liqtorCreditChange * -1 - SafeCast.toInt256(insuranceFee);
+        liqedPaperChange = liqtorPaperChange * -1;
+
+        // 更新仓位        
+        uint256 ltSN = state.positionSerialNum[liquidatedTrader][perp];
+        uint256 liquidatorSN = state.positionSerialNum[liquidator][perp];
+        // 被清算事件
+        emit BeingLiquidated(perp, liquidatedTrader, liqedPaperChange, liqedCreditChange, ltSN);
+        // 清算事件
+        emit JoinLiquidation(perp, liquidator, liquidatedTrader, liqtorPaperChange, liqtorCreditChange, liquidatorSN);
+        // 清算保险费
+        emit ChargeInsurance(perp, liquidatedTrader, insuranceFee);
+    }
+
+    /**
+     * @notice 获取标记价格
+     * @param state 系统状态
+     * @param prep 永续合约地址
+     * @return price 标记价格
+     */
+    function getMarkPrice(Types.State storage state, address prep) external view returns (uint256 price) {
+        price = IPriceSource(state.perpRiskParams[perp].markPriceSource).getMarkPrice();
+    }
+
+    /**
+     * @notice 处理坏账
+     * @param state 系统状态
+     * @param liquidatedTrader 被清算者地址
+     * 
+     * @dev 当交易者所有仓位清空但余额为负时：
+     *      1. 将负余额（坏账）转移给保险账户
+     *      2. 保险账户承担损失
+     *      3. 被清算者余额归零
+     */
+    function handleBadDebt(Types.State storage state, address liquidatedTrader) external {
+        // 只有放所有仓位已清空且账户不安全时才处理
+        if(state.openPositions[liquidatedTrader].length == 0 && 
+                !Liquidation._isMMSafe(state, liquidatedTrader)) {
+            int256 primaryCredit = state.primaryCredit[liquidatedTrader];
+            int256 secondaryCredit = state.secondaryCredit[liquidatedTrader];
+            // 清空被清算者余额
+            state.primaryCredit[liquidatedTrader] = 0;
+            state.secondaryCredit[liquidatedTrader] = 0;
+            // 坏账转入保险账户（负数意味着保险账户承担损失）
+            state.primaryCredit[state.insurance] += primaryCredit;
+            state.secondaryCredit[state.insurance] += secondaryCredit;
+            emit HandleBadDebt(liquidatedTrader, primaryCredit, secondaryCredit);
+        }
     }
 
 }
