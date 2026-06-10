@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import "./interface/IPerpetual.sol";
+
 /**
  * @title Perpetual - 永续合约市场
  * @author 
