@@ -208,7 +208,7 @@ library Liquidation {
      * 
      * @param state 系统状态
      * @param perp 永续合约地址
-     * @param liquidatedTrader 被清算者
+     * @param liquidatedTrader 被清算者地址
      * @param requestPaperAmount 请求清算的数量
      * @return liqtorPaperChange 清算者的paper 变化
      * @return liqtorCreditChange 清算者的credit 变化
