@@ -160,6 +160,21 @@ library Liquidation {
     }
 
     /**
+     * @notice 更严格的安全检查（用于取款主资产时）
+     * @param state 系统状态
+     * @param trader 交易者地址
+     * @return 是否 Solid IM 安全
+     * 
+     * @dev 额外要求：netPositionValue + primaryCredit >= 0
+     *      即不能依赖次级资产来满足初始保证金。
+     */
+    function _isSolidIMSafe(Types.State storage state, address trader) internal view returns (bool) {
+        (int256 netValue, , uint256 initialMargin,) getTotalExposure(state, trader);
+        // 净值减去次级资产后仍需 >= 0, 净值需要 >= 初始化保证金
+        return netValue - SafeCast.toInt256(state.secondaryCredit[trader]) >= 0 && netValue >= SafeCast.toInt256(initialMargin);
+    }
+
+    /**
      * 批量检查所有交易者是否 MM 安全
      * @param state 系统状态
      * @param traderList 交易者列表

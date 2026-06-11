@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "./interface/IPerpetual.sol";
+import "./interfaces/IPerpetual.sol";
+import "./interfaces/IDealer.sol";
 
 /**
  * @title Perpetual - 永续合约市场
@@ -193,7 +194,7 @@ contract Perpetual is Ownable, IPerpetual, ReentrancyGuard {
             int256 liqedPaperChange;
             int256 liqedCreditChange;
             (liqtorPaperChange, liqtorCreditChange, liqedPaperChange, liqedCreditChange) = 
-                IDealer(owner()).approveLiquidation(msg.sender, liquidator, liquidatedTrader, requestPaper);
+                IDealer(owner()).requestLiquidation(msg.sender, liquidator, liquidatedTrader, requestPaper);
             
             // 价格保护检查
             // 期望价格 = expectCredit / requestpaper * -1
@@ -219,7 +220,7 @@ contract Perpetual is Ownable, IPerpetual, ReentrancyGuard {
             _settle(liquidator, liqtorPaperChange, liqtorCreditChange);
 
             // 确保清算者是安全的
-            require(IDeaker(owner()).isSafe(liquidator), "LIQUIDATOR_NOT_SAFE");
+            require(IDealer(owner()).isSafe(liquidator), "LIQUIDATOR_NOT_SAFE");
 
             // 如果被清算者仓位归零，检查并处理坏账
             if (balanceMap[liquidatedTrader].paper == 0) {

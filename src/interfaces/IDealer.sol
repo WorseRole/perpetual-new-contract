@@ -76,11 +76,12 @@ interface IDealer {
 
 
     /**
-     * 
+     * 请求清算
      * @param executor 执行清算地址
      * @param liquidator 清算者
      * @param liquidatedTrader 被清算者
      * @param requestPaperAmount 请求清算的仓位数量，正数表示清算多头仓位，负数表示清算空头仓位
+     * 
      * @return liqtorPaperChange 清算者的 paper 变化
      * @return liqtorCreditChange 清算者的 credit 变化
      * @return liqedPaperChange 被清算者的 paper 变化
